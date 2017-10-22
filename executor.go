@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/Sirupsen/logrus"
 	"github.com/graphql-go/graphql/gqlerrors"
 	"github.com/graphql-go/graphql/language/ast"
 )
@@ -24,6 +25,9 @@ type ExecuteParams struct {
 }
 
 func Execute(p ExecuteParams) (result *Result) {
+	logrus.WithField("method", "Execute").Infof("enter")
+	defer logrus.WithField("method", "Execute").Infof("leave")
+
 	// Use background context if no context was provided
 	ctx := p.Context
 	if ctx == nil {
@@ -75,6 +79,13 @@ func Execute(p ExecuteParams) (result *Result) {
 			Root:             p.Root,
 			Operation:        exeContext.Operation,
 		})
+
+		if promise, ok := getPromise(result.Data); ok {
+			value := <-promise
+			result = &value
+			logrus.WithField("method", "Execute").Errorf("Resolved promise %v: %+v", promise, value)
+		}
+
 		select {
 		case out <- result:
 		case <-done:
@@ -166,6 +177,9 @@ type ExecuteOperationParams struct {
 }
 
 func executeOperation(p ExecuteOperationParams) *Result {
+	logrus.WithField("method", "executeOperation").Infof("enter")
+	defer logrus.WithField("method", "executeOperation").Infof("leave")
+
 	operationType, err := getOperationRootType(p.ExecutionContext.Schema, p.Operation)
 	if err != nil {
 		return &Result{Errors: gqlerrors.FormatErrors(err)}
@@ -271,21 +285,61 @@ func executeFieldsSerially(p ExecuteFieldsParams) *Result {
 
 // Implements the "Evaluating selection sets" section of the spec for "read" mode.
 func executeFields(p ExecuteFieldsParams) *Result {
+	logrus.WithField("method", "executeFields").Infof("enter")
+	defer logrus.WithField("method", "executeFields").Infof("leave")
+
 	if p.Source == nil {
 		p.Source = map[string]interface{}{}
 	}
+	logrus.WithField("method", "executeFields").Infof("Source: %+v", p.Source)
 	if p.Fields == nil {
 		p.Fields = map[string][]*ast.Field{}
 	}
+	logrus.WithField("method", "executeFields").Infof("Fields: %+v", reflect.ValueOf(p.Fields).MapKeys())
 
+	containsPromise := false
 	finalResults := map[string]interface{}{}
 	for responseName, fieldASTs := range p.Fields {
+		logrus.WithField("method", "executeFields").Infof("Resolving '%v'", responseName)
+
 		resolved, state := resolveField(p.ExecutionContext, p.ParentType, p.Source, fieldASTs)
 		if state.hasNoFieldDefs {
 			continue
 		}
 		finalResults[responseName] = resolved
+		logrus.WithField("method", "executeFields").Infof("Resolved '%v'", responseName)
+
+		if _, ok := getPromise(resolved); ok {
+			containsPromise = true
+		}
 	}
+
+	logrus.WithField("method", "executeFields").Infof("Contains promise: %+v", containsPromise)
+
+	if containsPromise {
+		// apply-lift over all fields
+		liftedPromise := make(chan Result)
+		go func() {
+			for key, value := range finalResults {
+				if promise, ok := getPromise(value); ok {
+					result := <-promise
+					finalResults[key] = result.Data
+					logrus.WithField("method", "executeFields").WithField("field", key).Errorf("Resolved promise %v: %+v", promise, finalResults[key])
+				}
+			}
+
+			liftedPromise <- Result{Data: finalResults}
+		}()
+
+		logrus.WithField("method", "executeFields").Warnf("Lift promise contained in %v: %v", finalResults, liftedPromise)
+
+		return &Result{
+			Data:   (<-chan Result)(liftedPromise),
+			Errors: p.ExecutionContext.Errors,
+		}
+	}
+
+	logrus.WithField("method", "executeFields").Infof("Results: %+v", finalResults)
 
 	return &Result{
 		Data:   finalResults,
@@ -539,6 +593,9 @@ func resolveField(eCtx *ExecutionContext, parentType *Object, source interface{}
 		fieldName = fieldAST.Name.Value
 	}
 
+	logrus.WithField("method", "resolveField").WithField("field", fieldName).Infof("enter")
+	defer logrus.WithField("method", "resolveField").WithField("field", fieldName).Infof("leave")
+
 	fieldDef := getFieldDef(eCtx.Schema, parentType, fieldName)
 	if fieldDef == nil {
 		resultState.hasNoFieldDefs = true
@@ -608,7 +665,19 @@ func completeValueCatchingError(eCtx *ExecutionContext, returnType Type, fieldAS
 	return completed
 }
 
-func completeValue(eCtx *ExecutionContext, returnType Type, fieldASTs []*ast.Field, info ResolveInfo, result interface{}) interface{} {
+func getPromise(value interface{}) (<-chan Result, bool) {
+	if promise, ok := value.(<-chan Result); ok {
+		return promise, true
+	}
+
+	return nil, false
+}
+
+func completeValue(eCtx *ExecutionContext, returnType Type, fieldASTs []*ast.Field, info ResolveInfo, result interface{}) (finalResult interface{}) {
+	logrus.WithField("method", "completeValue").WithField("field", info.FieldName).Infof("enter: %+v", result)
+	defer func() {
+		logrus.WithField("method", "completeValue").WithField("field", info.FieldName).Infof("leave: %+v", finalResult)
+	}()
 
 	resultVal := reflect.ValueOf(result)
 	if resultVal.IsValid() && resultVal.Type().Kind() == reflect.Func {
@@ -617,6 +686,19 @@ func completeValue(eCtx *ExecutionContext, returnType Type, fieldASTs []*ast.Fie
 		}
 		err := gqlerrors.NewFormattedError("Error resolving func. Expected `func() interface{}` signature")
 		panic(gqlerrors.FormatError(err))
+	}
+
+	if promise, ok := getPromise(result); ok {
+		// apply lift over completeValue
+		liftedPromise := make(chan Result)
+		go func() {
+			value := <-promise
+			liftedPromise <- Result{Data: completeValue(eCtx, returnType, fieldASTs, info, value.Data)}
+			logrus.WithField("method", "completeValue").WithField("field", info.FieldName).Errorf("Resolved promise %v: %+v", promise, value.Data)
+		}()
+		logrus.WithField("method", "completeValue").WithField("field", info.FieldName).Warnf("lift promise %v: %v", promise, liftedPromise)
+		finalResult = (<-chan Result)(liftedPromise)
+		return
 	}
 
 	// If field type is NonNull, complete for inner type, and throw field error
@@ -630,40 +712,48 @@ func completeValue(eCtx *ExecutionContext, returnType Type, fieldASTs []*ast.Fie
 			)
 			panic(gqlerrors.FormatError(err))
 		}
-		return completed
+		finalResult = completed
+		return
 	}
 
 	// If result value is null-ish (null, undefined, or NaN) then return null.
 	if isNullish(result) {
-		return nil
+		finalResult = nil
+		return
 	}
 
 	// If field type is List, complete each item in the list with the inner type
 	if returnType, ok := returnType.(*List); ok {
-		return completeListValue(eCtx, returnType, fieldASTs, info, result)
+		finalResult = completeListValue(eCtx, returnType, fieldASTs, info, result)
+		return
 	}
 
 	// If field type is a leaf type, Scalar or Enum, serialize to a valid value,
 	// returning null if serialization is not possible.
 	if returnType, ok := returnType.(*Scalar); ok {
-		return completeLeafValue(returnType, result)
+		finalResult = completeLeafValue(returnType, result)
+		return
 	}
 	if returnType, ok := returnType.(*Enum); ok {
-		return completeLeafValue(returnType, result)
+		finalResult = completeLeafValue(returnType, result)
+		return
 	}
 
 	// If field type is an abstract type, Interface or Union, determine the
 	// runtime Object type and complete for that type.
 	if returnType, ok := returnType.(*Union); ok {
-		return completeAbstractValue(eCtx, returnType, fieldASTs, info, result)
+		finalResult = completeAbstractValue(eCtx, returnType, fieldASTs, info, result)
+		return
 	}
 	if returnType, ok := returnType.(*Interface); ok {
-		return completeAbstractValue(eCtx, returnType, fieldASTs, info, result)
+		finalResult = completeAbstractValue(eCtx, returnType, fieldASTs, info, result)
+		return
 	}
 
 	// If field type is Object, execute and complete all sub-selections.
 	if returnType, ok := returnType.(*Object); ok {
-		return completeObjectValue(eCtx, returnType, fieldASTs, info, result)
+		finalResult = completeObjectValue(eCtx, returnType, fieldASTs, info, result)
+		return
 	}
 
 	// Not reachable. All possible output types have been considered.
@@ -673,7 +763,8 @@ func completeValue(eCtx *ExecutionContext, returnType Type, fieldASTs []*ast.Fie
 	if err != nil {
 		panic(gqlerrors.FormatError(err))
 	}
-	return nil
+	finalResult = nil
+	return
 }
 
 // completeAbstractValue completes value of an Abstract type (Union / Interface) by determining the runtime type
@@ -716,6 +807,9 @@ func completeAbstractValue(eCtx *ExecutionContext, returnType Abstract, fieldAST
 
 // completeObjectValue complete an Object value by executing all sub-selections.
 func completeObjectValue(eCtx *ExecutionContext, returnType *Object, fieldASTs []*ast.Field, info ResolveInfo, result interface{}) interface{} {
+
+	logrus.WithField("method", "completeObjectValue").WithField("field", info.FieldName).Infof("enter")
+	defer logrus.WithField("method", "completeObjectValue").WithField("field", info.FieldName).Infof("leave")
 
 	// If there is an isTypeOf predicate function, call it with the
 	// current result. If isTypeOf returns false, then raise an error rather
@@ -775,6 +869,9 @@ func completeLeafValue(returnType Leaf, result interface{}) interface{} {
 
 // completeListValue complete a list value by completing each item in the list with the inner type
 func completeListValue(eCtx *ExecutionContext, returnType *List, fieldASTs []*ast.Field, info ResolveInfo, result interface{}) interface{} {
+	logrus.WithField("method", "completeListValue").WithField("field", info.FieldName).Infof("enter")
+	defer logrus.WithField("method", "completeListValue").WithField("field", info.FieldName).Infof("leave")
+
 	resultVal := reflect.ValueOf(result)
 	parentTypeName := ""
 	if info.ParentType != nil {
@@ -789,13 +886,47 @@ func completeListValue(eCtx *ExecutionContext, returnType *List, fieldASTs []*as
 		panic(gqlerrors.FormatError(err))
 	}
 
+	containsPromise := false
+
 	itemType := returnType.OfType
-	completedResults := []interface{}{}
+	completedResults := make([]interface{}, resultVal.Len())
 	for i := 0; i < resultVal.Len(); i++ {
+		logrus.WithField("method", "completeListValue").WithField("field", info.FieldName).WithField("index", i).Infof("begin")
+
 		val := resultVal.Index(i).Interface()
 		completedItem := completeValueCatchingError(eCtx, itemType, fieldASTs, info, val)
-		completedResults = append(completedResults, completedItem)
+		completedResults[i] = completedItem
+
+		if _, ok := getPromise(completedItem); ok {
+			containsPromise = true
+		}
+
+		logrus.WithField("method", "completeListValue").WithField("field", info.FieldName).WithField("index", i).Infof("end")
 	}
+
+	defer logrus.WithField("method", "completeListValue").WithField("field", info.FieldName).Infof("Contains promise: %v", containsPromise)
+
+	if containsPromise {
+		// apply-lift over all list items
+		liftedPromise := make(chan Result)
+
+		go func() {
+			for index, value := range completedResults {
+				if promise, ok := getPromise(value); ok {
+					result := <-promise
+					completedResults[index] = result.Data
+					logrus.WithField("method", "completeListValue").WithField("field", info.FieldName).WithField("index", index).Errorf("Resolved promise %v: %+v", promise, completedResults[index])
+				}
+			}
+
+			liftedPromise <- Result{Data: completedResults}
+		}()
+
+		logrus.WithField("method", "completeListValue").Warnf("Lift promise contained in %v: %v", completedResults, liftedPromise)
+
+		return (<-chan Result)(liftedPromise)
+	}
+
 	return completedResults
 }
 

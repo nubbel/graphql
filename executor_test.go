@@ -13,6 +13,7 @@ import (
 	"github.com/graphql-go/graphql/gqlerrors"
 	"github.com/graphql-go/graphql/language/location"
 	"github.com/graphql-go/graphql/testutil"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestExecutesArbitraryCode(t *testing.T) {
@@ -205,6 +206,86 @@ func TestExecutesArbitraryCode(t *testing.T) {
 	if len(result.Errors) > 0 {
 		t.Fatalf("wrong result, unexpected errors: %v", result.Errors)
 	}
+	if !reflect.DeepEqual(expected, result) {
+		t.Fatalf("Unexpected result, Diff: %v", testutil.Diff(expected, result))
+	}
+}
+func TestExecutesPromises(t *testing.T) {
+	query := `
+      query Example {
+        tests {
+					foo
+				}
+      }
+    `
+
+	expected := &graphql.Result{
+		Data: map[string]interface{}{
+			"tests": []interface{}{
+				map[string]interface{}{
+					"foo": "hello",
+				},
+				map[string]interface{}{
+					"foo": "hello",
+				},
+			},
+		},
+	}
+
+	testType := graphql.NewObject(graphql.ObjectConfig{
+		Name: "Test",
+		Fields: graphql.Fields{
+			"foo": &graphql.Field{
+				Type: graphql.String,
+				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+					promise := make(chan graphql.Result)
+					go func() {
+						promise <- graphql.Result{Data: "hello"}
+					}()
+
+					return (<-chan graphql.Result)(promise), nil
+				},
+			},
+		},
+	})
+
+	dataType := graphql.NewObject(graphql.ObjectConfig{
+		Name: "DataType",
+		Fields: graphql.Fields{
+			"tests": &graphql.Field{
+				Type: graphql.NewList(testType),
+				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+					return []string{"hello", "world"}, nil
+				},
+			},
+		},
+	})
+
+	schema, err := graphql.NewSchema(graphql.SchemaConfig{
+		Query: dataType,
+	})
+	if err != nil {
+		t.Fatalf("Error in schema %v", err.Error())
+	}
+
+	// parse query
+	astDoc := testutil.TestParse(t, query)
+
+	// execute
+	operationName := "Example"
+	ep := graphql.ExecuteParams{
+		Schema:        schema,
+		Root:          struct{}{},
+		AST:           astDoc,
+		OperationName: operationName,
+	}
+	result := testutil.TestExecute(t, ep)
+	if len(result.Errors) > 0 {
+		t.Fatalf("wrong result, unexpected errors: %v", result.Errors)
+	}
+
+	assert.Equal(t, expected, result)
+
 	if !reflect.DeepEqual(expected, result) {
 		t.Fatalf("Unexpected result, Diff: %v", testutil.Diff(expected, result))
 	}
