@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/graphql-go/graphql/gqlerrors"
 	"github.com/graphql-go/graphql/language/location"
 	"github.com/graphql-go/graphql/testutil"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestExecutesArbitraryCode(t *testing.T) {
@@ -31,7 +33,9 @@ func TestExecutesArbitraryCode(t *testing.T) {
 		"deep": func() interface{} { return deepData },
 	}
 	data["promise"] = func() interface{} {
-		return data
+		return func() (interface{}, error) {
+			return data, nil
+		}
 	}
 	deepData = map[string]interface{}{
 		"a":      func() interface{} { return "Already Been Done" },
@@ -205,6 +209,92 @@ func TestExecutesArbitraryCode(t *testing.T) {
 	if len(result.Errors) > 0 {
 		t.Fatalf("wrong result, unexpected errors: %v", result.Errors)
 	}
+	if !reflect.DeepEqual(expected, result) {
+		t.Fatalf("Unexpected result, Diff: %v", testutil.Diff(expected, result))
+	}
+}
+func TestExecutesPromises(t *testing.T) {
+	query := `
+      query Example {
+        tests {
+					counter
+				}
+      }
+    `
+
+	expected := &graphql.Result{
+		Data: map[string]interface{}{
+			"tests": []interface{}{
+				map[string]interface{}{
+					"counter": 2,
+				},
+				map[string]interface{}{
+					"counter": 2,
+				},
+			},
+		},
+	}
+
+	var counter uint64
+
+	testType := graphql.NewObject(graphql.ObjectConfig{
+		Name: "Test",
+		Fields: graphql.Fields{
+			"counter": &graphql.Field{
+				Type: graphql.Int,
+				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+					atomic.AddUint64(&counter, 1)
+					thunk := func() (interface{}, error) {
+						return counter, nil
+					}
+
+					return thunk, nil
+				},
+			},
+		},
+	})
+
+	dataType := graphql.NewObject(graphql.ObjectConfig{
+		Name: "DataType",
+		Fields: graphql.Fields{
+			"tests": &graphql.Field{
+				Type: graphql.NewList(testType),
+				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+					thunk := func() (interface{}, error) {
+						return []string{"hello", "world"}, nil
+					}
+
+					return thunk, nil
+				},
+			},
+		},
+	})
+
+	schema, err := graphql.NewSchema(graphql.SchemaConfig{
+		Query: dataType,
+	})
+	if err != nil {
+		t.Fatalf("Error in schema %v", err.Error())
+	}
+
+	// parse query
+	astDoc := testutil.TestParse(t, query)
+
+	// execute
+	operationName := "Example"
+	ep := graphql.ExecuteParams{
+		Schema:        schema,
+		Root:          struct{}{},
+		AST:           astDoc,
+		OperationName: operationName,
+	}
+	result := testutil.TestExecute(t, ep)
+	if len(result.Errors) > 0 {
+		t.Fatalf("wrong result, unexpected errors: %v", result.Errors)
+	}
+
+	assert.Equal(t, expected, result)
+
 	if !reflect.DeepEqual(expected, result) {
 		t.Fatalf("Unexpected result, Diff: %v", testutil.Diff(expected, result))
 	}

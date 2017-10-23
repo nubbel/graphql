@@ -75,6 +75,17 @@ func Execute(p ExecuteParams) (result *Result) {
 			Root:             p.Root,
 			Operation:        exeContext.Operation,
 		})
+
+		if thunk, ok := getThunk(result.Data); ok {
+			value, err := thunk()
+
+			if err != nil {
+				result.Errors = append(result.Errors, gqlerrors.FormatError(err))
+			}
+
+			result.Data = value
+		}
+
 		select {
 		case out <- result:
 		case <-done:
@@ -242,7 +253,8 @@ type ExecuteFieldsParams struct {
 	ExecutionContext *ExecutionContext
 	ParentType       *Object
 	Source           interface{}
-	Fields           map[string][]*ast.Field
+
+	Fields map[string][]*ast.Field
 }
 
 // Implements the "Evaluating selection sets" section of the spec for "write" mode.
@@ -253,16 +265,15 @@ func executeFieldsSerially(p ExecuteFieldsParams) *Result {
 	if p.Fields == nil {
 		p.Fields = map[string][]*ast.Field{}
 	}
-
 	finalResults := map[string]interface{}{}
 	for responseName, fieldASTs := range p.Fields {
+
 		resolved, state := resolveField(p.ExecutionContext, p.ParentType, p.Source, fieldASTs)
 		if state.hasNoFieldDefs {
 			continue
 		}
 		finalResults[responseName] = resolved
 	}
-
 	return &Result{
 		Data:   finalResults,
 		Errors: p.ExecutionContext.Errors,
@@ -278,13 +289,47 @@ func executeFields(p ExecuteFieldsParams) *Result {
 		p.Fields = map[string][]*ast.Field{}
 	}
 
+	containsThunk := false
 	finalResults := map[string]interface{}{}
 	for responseName, fieldASTs := range p.Fields {
+
 		resolved, state := resolveField(p.ExecutionContext, p.ParentType, p.Source, fieldASTs)
 		if state.hasNoFieldDefs {
 			continue
 		}
 		finalResults[responseName] = resolved
+
+		if _, ok := getThunk(resolved); ok {
+			containsThunk = true
+		}
+	}
+
+	if containsThunk {
+		// apply lift over all fields
+		liftedThunk := func() (interface{}, error) {
+			for key, value := range finalResults {
+				for {
+					if thunk, ok := getThunk(value); ok {
+						var err error
+						value, err = thunk()
+						if err != nil {
+							return nil, err
+						}
+
+						finalResults[key] = value
+					} else {
+						break
+					}
+				}
+			}
+
+			return finalResults, nil
+		}
+
+		return &Result{
+			Data:   liftedThunk,
+			Errors: p.ExecutionContext.Errors,
+		}
 	}
 
 	return &Result{
@@ -608,7 +653,30 @@ func completeValueCatchingError(eCtx *ExecutionContext, returnType Type, fieldAS
 	return completed
 }
 
-func completeValue(eCtx *ExecutionContext, returnType Type, fieldASTs []*ast.Field, info ResolveInfo, result interface{}) interface{} {
+func getThunk(value interface{}) (func() (interface{}, error), bool) {
+	if thunk, ok := value.(func() (interface{}, error)); ok {
+		return thunk, true
+	}
+
+	return nil, false
+}
+
+func completeValue(eCtx *ExecutionContext, returnType Type, fieldASTs []*ast.Field, info ResolveInfo, result interface{}) (finalResult interface{}) {
+
+	// If result is a thunk, apply lift over completeValue.
+	if thunk, ok := getThunk(result); ok {
+		finalResult = func() (interface{}, error) {
+			value, err := thunk()
+
+			if err != nil {
+				return nil, err
+			}
+
+			return completeValue(eCtx, returnType, fieldASTs, info, value), nil
+		}
+
+		return
+	}
 
 	resultVal := reflect.ValueOf(result)
 	if resultVal.IsValid() && resultVal.Type().Kind() == reflect.Func {
@@ -630,40 +698,48 @@ func completeValue(eCtx *ExecutionContext, returnType Type, fieldASTs []*ast.Fie
 			)
 			panic(gqlerrors.FormatError(err))
 		}
-		return completed
+		finalResult = completed
+		return
 	}
 
 	// If result value is null-ish (null, undefined, or NaN) then return null.
 	if isNullish(result) {
-		return nil
+		finalResult = nil
+		return
 	}
 
 	// If field type is List, complete each item in the list with the inner type
 	if returnType, ok := returnType.(*List); ok {
-		return completeListValue(eCtx, returnType, fieldASTs, info, result)
+		finalResult = completeListValue(eCtx, returnType, fieldASTs, info, result)
+		return
 	}
 
 	// If field type is a leaf type, Scalar or Enum, serialize to a valid value,
 	// returning null if serialization is not possible.
 	if returnType, ok := returnType.(*Scalar); ok {
-		return completeLeafValue(returnType, result)
+		finalResult = completeLeafValue(returnType, result)
+		return
 	}
 	if returnType, ok := returnType.(*Enum); ok {
-		return completeLeafValue(returnType, result)
+		finalResult = completeLeafValue(returnType, result)
+		return
 	}
 
 	// If field type is an abstract type, Interface or Union, determine the
 	// runtime Object type and complete for that type.
 	if returnType, ok := returnType.(*Union); ok {
-		return completeAbstractValue(eCtx, returnType, fieldASTs, info, result)
+		finalResult = completeAbstractValue(eCtx, returnType, fieldASTs, info, result)
+		return
 	}
 	if returnType, ok := returnType.(*Interface); ok {
-		return completeAbstractValue(eCtx, returnType, fieldASTs, info, result)
+		finalResult = completeAbstractValue(eCtx, returnType, fieldASTs, info, result)
+		return
 	}
 
 	// If field type is Object, execute and complete all sub-selections.
 	if returnType, ok := returnType.(*Object); ok {
-		return completeObjectValue(eCtx, returnType, fieldASTs, info, result)
+		finalResult = completeObjectValue(eCtx, returnType, fieldASTs, info, result)
+		return
 	}
 
 	// Not reachable. All possible output types have been considered.
@@ -673,7 +749,8 @@ func completeValue(eCtx *ExecutionContext, returnType Type, fieldASTs []*ast.Fie
 	if err != nil {
 		panic(gqlerrors.FormatError(err))
 	}
-	return nil
+	finalResult = nil
+	return
 }
 
 // completeAbstractValue completes value of an Abstract type (Union / Interface) by determining the runtime type
@@ -775,6 +852,7 @@ func completeLeafValue(returnType Leaf, result interface{}) interface{} {
 
 // completeListValue complete a list value by completing each item in the list with the inner type
 func completeListValue(eCtx *ExecutionContext, returnType *List, fieldASTs []*ast.Field, info ResolveInfo, result interface{}) interface{} {
+
 	resultVal := reflect.ValueOf(result)
 	parentTypeName := ""
 	if info.ParentType != nil {
@@ -789,13 +867,42 @@ func completeListValue(eCtx *ExecutionContext, returnType *List, fieldASTs []*as
 		panic(gqlerrors.FormatError(err))
 	}
 
+	containsThunk := false
+
 	itemType := returnType.OfType
-	completedResults := []interface{}{}
+	completedResults := make([]interface{}, resultVal.Len())
 	for i := 0; i < resultVal.Len(); i++ {
+
 		val := resultVal.Index(i).Interface()
 		completedItem := completeValueCatchingError(eCtx, itemType, fieldASTs, info, val)
-		completedResults = append(completedResults, completedItem)
+		completedResults[i] = completedItem
+
+		if _, ok := getThunk(completedItem); ok {
+			containsThunk = true
+		}
+
 	}
+
+	if containsThunk {
+		// apply-lift over all list items
+		liftedThunk := func() (interface{}, error) {
+			for index, value := range completedResults {
+				if thunk, ok := getThunk(value); ok {
+					value, err := thunk()
+
+					if err != nil {
+						return nil, err
+					}
+					completedResults[index] = value
+				}
+			}
+
+			return completedResults, nil
+		}
+
+		return liftedThunk
+	}
+
 	return completedResults
 }
 
