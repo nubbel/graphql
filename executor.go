@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 
+	// "github.com/Sirupsen/logrus"
 	"github.com/graphql-go/graphql/gqlerrors"
 	"github.com/graphql-go/graphql/language/ast"
 )
@@ -77,13 +78,10 @@ func Execute(p ExecuteParams) (result *Result) {
 		})
 
 		if thunk, ok := getThunk(result.Data); ok {
-			value, err := thunk()
-
-			if err != nil {
-				result.Errors = append(result.Errors, gqlerrors.FormatError(err))
-			}
+			value, _ := thunk.Get()
 
 			result.Data = value
+			result.Errors = exeContext.Errors
 		}
 
 		select {
@@ -272,6 +270,11 @@ func executeFieldsSerially(p ExecuteFieldsParams) *Result {
 		if state.hasNoFieldDefs {
 			continue
 		}
+
+		if thunk, ok := getThunk(resolved); ok {
+			resolved, _ = thunk.Get()
+		}
+
 		finalResults[responseName] = resolved
 	}
 	return &Result{
@@ -294,47 +297,34 @@ func executeFields(p ExecuteFieldsParams) *Result {
 	for responseName, fieldASTs := range p.Fields {
 
 		resolved, state := resolveField(p.ExecutionContext, p.ParentType, p.Source, fieldASTs)
+		// logrus.WithField("field", responseName).Infof("resolved: %+v", resolved)
 		if state.hasNoFieldDefs {
 			continue
 		}
 		finalResults[responseName] = resolved
 
-		if _, ok := getThunk(resolved); ok {
-			containsThunk = true
+		if !containsThunk {
+			if _, ok := getThunk(resolved); ok {
+				// logrus.WithField("field", responseName).Infof("thunk detected")
+				containsThunk = true
+			}
 		}
 	}
 
-	if containsThunk {
-		// apply lift over all fields
-		liftedThunk := func() (interface{}, error) {
-			for key, value := range finalResults {
-				for {
-					if thunk, ok := getThunk(value); ok {
-						var err error
-						value, err = thunk()
-						if err != nil {
-							return nil, err
-						}
-
-						finalResults[key] = value
-					} else {
-						break
-					}
-				}
-			}
-
-			return finalResults, nil
-		}
-
+	// If there are no thunks, we can just return the object
+	if !containsThunk {
 		return &Result{
-			Data:   liftedThunk,
+			Data:   finalResults,
 			Errors: p.ExecutionContext.Errors,
 		}
 	}
 
+	// Otherwise, results is a map from field name to the result
+	// of resolving that field, which is possibly a thunk. Return
+	// a thunk that will return this same map, but with any
+	// thunks replaced with the values they resolved to.
 	return &Result{
-		Data:   finalResults,
-		Errors: p.ExecutionContext.Errors,
+		Data: thunkForMap(finalResults),
 	}
 }
 
@@ -630,13 +620,14 @@ func resolveField(eCtx *ExecutionContext, parentType *Object, source interface{}
 }
 
 func completeValueCatchingError(eCtx *ExecutionContext, returnType Type, fieldASTs []*ast.Field, info ResolveInfo, result interface{}) (completed interface{}) {
+	if returnType, ok := returnType.(*NonNull); ok {
+		completed := completeValue(eCtx, returnType, fieldASTs, info, result)
+		return completed
+	}
+
 	// catch panic
 	defer func() interface{} {
 		if r := recover(); r != nil {
-			//send panic upstream
-			if _, ok := returnType.(*NonNull); ok {
-				panic(r)
-			}
 			if err, ok := r.(gqlerrors.FormattedError); ok {
 				eCtx.Errors = append(eCtx.Errors, err)
 			}
@@ -645,37 +636,25 @@ func completeValueCatchingError(eCtx *ExecutionContext, returnType Type, fieldAS
 		return completed
 	}()
 
-	if returnType, ok := returnType.(*NonNull); ok {
-		completed := completeValue(eCtx, returnType, fieldASTs, info, result)
-		return completed
-	}
 	completed = completeValue(eCtx, returnType, fieldASTs, info, result)
+
+	if thunk, ok := getThunk(completed); ok {
+		return thunk.Catch(func(err error) (interface{}, error) {
+			eCtx.Errors = append(eCtx.Errors, gqlerrors.FormatError(err))
+			return nil, nil
+		})
+	}
+
 	return completed
 }
 
-func getThunk(value interface{}) (func() (interface{}, error), bool) {
-	if thunk, ok := value.(func() (interface{}, error)); ok {
-		return thunk, true
-	}
-
-	return nil, false
-}
-
-func completeValue(eCtx *ExecutionContext, returnType Type, fieldASTs []*ast.Field, info ResolveInfo, result interface{}) (finalResult interface{}) {
+func completeValue(eCtx *ExecutionContext, returnType Type, fieldASTs []*ast.Field, info ResolveInfo, result interface{}) interface{} {
 
 	// If result is a thunk, apply lift over completeValue.
 	if thunk, ok := getThunk(result); ok {
-		finalResult = func() (interface{}, error) {
-			value, err := thunk()
-
-			if err != nil {
-				return nil, err
-			}
-
+		return thunk.Then(func(value interface{}) (interface{}, error) {
 			return completeValue(eCtx, returnType, fieldASTs, info, value), nil
-		}
-
-		return
+		})
 	}
 
 	resultVal := reflect.ValueOf(result)
@@ -683,7 +662,7 @@ func completeValue(eCtx *ExecutionContext, returnType Type, fieldASTs []*ast.Fie
 		if propertyFn, ok := result.(func() interface{}); ok {
 			return propertyFn()
 		}
-		err := gqlerrors.NewFormattedError("Error resolving func. Expected `func() interface{}` signature")
+		err := gqlerrors.NewFormattedError(fmt.Sprintf("Error resolving func. Expected `func() interface{}` signature, got %v", resultVal.Type()))
 		panic(gqlerrors.FormatError(err))
 	}
 
@@ -698,48 +677,40 @@ func completeValue(eCtx *ExecutionContext, returnType Type, fieldASTs []*ast.Fie
 			)
 			panic(gqlerrors.FormatError(err))
 		}
-		finalResult = completed
-		return
+		return completed
 	}
 
 	// If result value is null-ish (null, undefined, or NaN) then return null.
 	if isNullish(result) {
-		finalResult = nil
-		return
+		return nil
 	}
 
 	// If field type is List, complete each item in the list with the inner type
 	if returnType, ok := returnType.(*List); ok {
-		finalResult = completeListValue(eCtx, returnType, fieldASTs, info, result)
-		return
+		return completeListValue(eCtx, returnType, fieldASTs, info, result)
 	}
 
 	// If field type is a leaf type, Scalar or Enum, serialize to a valid value,
 	// returning null if serialization is not possible.
 	if returnType, ok := returnType.(*Scalar); ok {
-		finalResult = completeLeafValue(returnType, result)
-		return
+		return completeLeafValue(returnType, result)
 	}
 	if returnType, ok := returnType.(*Enum); ok {
-		finalResult = completeLeafValue(returnType, result)
-		return
+		return completeLeafValue(returnType, result)
 	}
 
 	// If field type is an abstract type, Interface or Union, determine the
 	// runtime Object type and complete for that type.
 	if returnType, ok := returnType.(*Union); ok {
-		finalResult = completeAbstractValue(eCtx, returnType, fieldASTs, info, result)
-		return
+		return completeAbstractValue(eCtx, returnType, fieldASTs, info, result)
 	}
 	if returnType, ok := returnType.(*Interface); ok {
-		finalResult = completeAbstractValue(eCtx, returnType, fieldASTs, info, result)
-		return
+		return completeAbstractValue(eCtx, returnType, fieldASTs, info, result)
 	}
 
 	// If field type is Object, execute and complete all sub-selections.
 	if returnType, ok := returnType.(*Object); ok {
-		finalResult = completeObjectValue(eCtx, returnType, fieldASTs, info, result)
-		return
+		return completeObjectValue(eCtx, returnType, fieldASTs, info, result)
 	}
 
 	// Not reachable. All possible output types have been considered.
@@ -749,8 +720,7 @@ func completeValue(eCtx *ExecutionContext, returnType Type, fieldASTs []*ast.Fie
 	if err != nil {
 		panic(gqlerrors.FormatError(err))
 	}
-	finalResult = nil
-	return
+	return nil
 }
 
 // completeAbstractValue completes value of an Abstract type (Union / Interface) by determining the runtime type
@@ -877,30 +847,16 @@ func completeListValue(eCtx *ExecutionContext, returnType *List, fieldASTs []*as
 		completedItem := completeValueCatchingError(eCtx, itemType, fieldASTs, info, val)
 		completedResults[i] = completedItem
 
-		if _, ok := getThunk(completedItem); ok {
-			containsThunk = true
+		if !containsThunk {
+			if _, ok := getThunk(completedItem); ok {
+				containsThunk = true
+			}
 		}
-
 	}
 
 	if containsThunk {
-		// apply-lift over all list items
-		liftedThunk := func() (interface{}, error) {
-			for index, value := range completedResults {
-				if thunk, ok := getThunk(value); ok {
-					value, err := thunk()
-
-					if err != nil {
-						return nil, err
-					}
-					completedResults[index] = value
-				}
-			}
-
-			return completedResults, nil
-		}
-
-		return liftedThunk
+		// apply lift over all list items
+		return WhenAll(completedResults)
 	}
 
 	return completedResults

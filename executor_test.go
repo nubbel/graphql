@@ -10,10 +10,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sirupsen/logrus"
 	"github.com/graphql-go/graphql"
 	"github.com/graphql-go/graphql/gqlerrors"
 	"github.com/graphql-go/graphql/language/location"
 	"github.com/graphql-go/graphql/testutil"
+	"github.com/nicksrandall/dataloader"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -33,9 +35,9 @@ func TestExecutesArbitraryCode(t *testing.T) {
 		"deep": func() interface{} { return deepData },
 	}
 	data["promise"] = func() interface{} {
-		return func() (interface{}, error) {
+		return graphql.Thunk(func() (interface{}, error) {
 			return data, nil
-		}
+		})
 	}
 	deepData = map[string]interface{}{
 		"a":      func() interface{} { return "Already Been Done" },
@@ -210,6 +212,7 @@ func TestExecutesArbitraryCode(t *testing.T) {
 		t.Fatalf("wrong result, unexpected errors: %v", result.Errors)
 	}
 	if !reflect.DeepEqual(expected, result) {
+		t.Logf("Type: %v", reflect.TypeOf(result.Data))
 		t.Fatalf("Unexpected result, Diff: %v", testutil.Diff(expected, result))
 	}
 }
@@ -217,7 +220,13 @@ func TestExecutesPromises(t *testing.T) {
 	query := `
       query Example {
         tests {
-					counter
+					len
+					deep {
+						len
+					}
+					deeper {
+						len
+					}
 				}
       }
     `
@@ -226,31 +235,113 @@ func TestExecutesPromises(t *testing.T) {
 		Data: map[string]interface{}{
 			"tests": []interface{}{
 				map[string]interface{}{
-					"counter": 2,
+					"len": 5,
+					"deep": map[string]interface{}{
+						"len": 4,
+					},
+					"deeper": []interface{}{
+						map[string]interface{}{
+							"len": 6,
+						},
+						map[string]interface{}{
+							"len": 3,
+						},
+						map[string]interface{}{
+							"len": 3,
+						},
+					},
 				},
 				map[string]interface{}{
-					"counter": 2,
+					"len": 6,
+					"deep": map[string]interface{}{
+						"len": 4,
+					},
+					"deeper": []interface{}{
+						map[string]interface{}{
+							"len": 6,
+						},
+						map[string]interface{}{
+							"len": 3,
+						},
+						map[string]interface{}{
+							"len": 3,
+						},
+					},
 				},
 			},
 		},
 	}
 
-	var counter uint64
+	// setup batch function
+	batchFn := func(ctx context.Context, keys []string) []*dataloader.Result {
+		logrus.Warnf("batch: %+v", keys)
 
+		// time.Sleep(2 * time.Second)
+
+		results := make([]*dataloader.Result, len(keys))
+
+		var n = 412234234234234234234234.023424234234324
+		for index := 0; index < 10000000000; index++ {
+			n /= 1.12312312312312323123
+		}
+
+		for i, key := range keys {
+			results[i] = &dataloader.Result{Data: len(key)}
+		}
+
+		return results
+	}
+
+	// create Loader with an in-memory cache
+	loader := dataloader.NewBatchedLoader(batchFn, dataloader.WithWait(0*time.Millisecond))
+
+	var counter uint64
 	testType := graphql.NewObject(graphql.ObjectConfig{
 		Name: "Test",
 		Fields: graphql.Fields{
-			"counter": &graphql.Field{
+			"len": &graphql.Field{
 				Type: graphql.Int,
 				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
-					atomic.AddUint64(&counter, 1)
-					thunk := func() (interface{}, error) {
-						return counter, nil
-					}
+					s := p.Source.(string)
+
+					thunk := graphql.Thunk(loader.Load(p.Context, s))
 
 					return thunk, nil
 				},
 			},
+			"counter": &graphql.Field{
+				Type: graphql.Int,
+				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+					atomic.AddUint64(&counter, 1)
+					thunk := graphql.Thunk(func() (interface{}, error) {
+						return counter, nil
+					})
+
+					return thunk, nil
+				},
+			},
+		},
+	})
+
+	testType.AddFieldConfig("deep", &graphql.Field{
+		Type: testType,
+		Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			thunk := graphql.Thunk(func() (interface{}, error) {
+				return "deep", nil
+			})
+
+			return thunk, nil
+		},
+	})
+
+	testType.AddFieldConfig("deeper", &graphql.Field{
+		Type: graphql.NewList(testType),
+		Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			thunk := graphql.Thunk(func() (interface{}, error) {
+				return []string{"deeper", "foo", "bar"}, nil
+			})
+
+			return thunk, nil
 		},
 	})
 
@@ -260,9 +351,9 @@ func TestExecutesPromises(t *testing.T) {
 			"tests": &graphql.Field{
 				Type: graphql.NewList(testType),
 				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
-					thunk := func() (interface{}, error) {
-						return []string{"hello", "world"}, nil
-					}
+					thunk := graphql.Thunk(func() (interface{}, error) {
+						return []string{"hello", "world!"}, nil
+					})
 
 					return thunk, nil
 				},
@@ -296,6 +387,7 @@ func TestExecutesPromises(t *testing.T) {
 	assert.Equal(t, expected, result)
 
 	if !reflect.DeepEqual(expected, result) {
+		t.Logf("Type: %v", reflect.TypeOf(result.Data))
 		t.Fatalf("Unexpected result, Diff: %v", testutil.Diff(expected, result))
 	}
 }
@@ -620,9 +712,9 @@ func TestNullsOutErrorSubtrees(t *testing.T) {
 		"sync": func() interface{} {
 			return "sync"
 		},
-		"syncError": func() interface{} {
+		"syncError": graphql.Thunk(func() (interface{}, error) {
 			panic("Error getting syncError")
-		},
+		}),
 	}
 	schema, err := graphql.NewSchema(graphql.SchemaConfig{
 		Query: graphql.NewObject(graphql.ObjectConfig{
