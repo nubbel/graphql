@@ -304,7 +304,7 @@ func TestExecutesPromises(t *testing.T) {
 				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
 					s := p.Source.(string)
 
-					thunk := graphql.Thunk(loader.Load(p.Context, s))
+					thunk := loader.Load(p.Context, s)
 
 					return thunk, nil
 				},
@@ -326,6 +326,9 @@ func TestExecutesPromises(t *testing.T) {
 	testType.AddFieldConfig("deep", &graphql.Field{
 		Type: testType,
 		Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			s := p.Source.(string)
+			logrus.Infof("deep Source: %s", s)
+
 			thunk := graphql.Thunk(func() (interface{}, error) {
 				return "deep", nil
 			})
@@ -337,6 +340,9 @@ func TestExecutesPromises(t *testing.T) {
 	testType.AddFieldConfig("deeper", &graphql.Field{
 		Type: graphql.NewList(testType),
 		Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			s := p.Source.(string)
+			logrus.Infof("deeper Source: %s", s)
+
 			thunk := graphql.Thunk(func() (interface{}, error) {
 				return []string{"deeper", "foo", "bar"}, nil
 			})

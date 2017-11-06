@@ -78,7 +78,7 @@ func Execute(p ExecuteParams) (result *Result) {
 		})
 
 		if thunk, ok := getThunk(result.Data); ok {
-			value, _ := thunk.Get()
+			value, _ := thunk.Await()
 
 			result.Data = value
 			result.Errors = exeContext.Errors
@@ -272,7 +272,7 @@ func executeFieldsSerially(p ExecuteFieldsParams) *Result {
 		}
 
 		if thunk, ok := getThunk(resolved); ok {
-			resolved, _ = thunk.Get()
+			resolved, _ = thunk.Await()
 		}
 
 		finalResults[responseName] = resolved
