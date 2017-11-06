@@ -7,7 +7,6 @@ import (
 	"reflect"
 	"strings"
 
-	// "github.com/Sirupsen/logrus"
 	"github.com/graphql-go/graphql/gqlerrors"
 	"github.com/graphql-go/graphql/language/ast"
 )
@@ -193,11 +192,25 @@ func executeOperation(p ExecuteOperationParams) *Result {
 		Fields:           fields,
 	}
 
+	var result *Result
 	if p.Operation.GetOperation() == ast.OperationTypeMutation {
-		return executeFieldsSerially(executeFieldsParams)
+		result = executeFieldsSerially(executeFieldsParams)
 	}
-	return executeFields(executeFieldsParams)
+	result = executeFields(executeFieldsParams)
 
+	// Errors from sub-fields of a NonNull type may propagate to the top level,
+	// at which point we still log the error and null the parent field, which
+	// in this case is the entire response.
+	//
+	// Similar to `completeValueCatchingError`.
+	if thunk, ok := getThunk(result.Data); ok {
+		result.Data = thunk.Catch(func(err error) (interface{}, error) {
+			p.ExecutionContext.Errors = append(p.ExecutionContext.Errors, gqlerrors.FormatError(err))
+			return nil, nil
+		})
+	}
+
+	return result
 }
 
 // Extracts the root type of the operation from the schema.
@@ -297,7 +310,6 @@ func executeFields(p ExecuteFieldsParams) *Result {
 	for responseName, fieldASTs := range p.Fields {
 
 		resolved, state := resolveField(p.ExecutionContext, p.ParentType, p.Source, fieldASTs)
-		// logrus.WithField("field", responseName).Infof("resolved: %+v", resolved)
 		if state.hasNoFieldDefs {
 			continue
 		}
@@ -305,7 +317,6 @@ func executeFields(p ExecuteFieldsParams) *Result {
 
 		if !containsThunk {
 			if _, ok := getThunk(resolved); ok {
-				// logrus.WithField("field", responseName).Infof("thunk detected")
 				containsThunk = true
 			}
 		}
@@ -547,7 +558,6 @@ func resolveField(eCtx *ExecutionContext, parentType *Object, source interface{}
 	var returnType Output
 	defer func() (interface{}, resolveFieldResultState) {
 		if r := recover(); r != nil {
-
 			var err error
 			if r, ok := r.(string); ok {
 				err = NewLocatedError(
@@ -620,25 +630,34 @@ func resolveField(eCtx *ExecutionContext, parentType *Object, source interface{}
 }
 
 func completeValueCatchingError(eCtx *ExecutionContext, returnType Type, fieldASTs []*ast.Field, info ResolveInfo, result interface{}) (completed interface{}) {
+	// If the field type is non-nullable, then it is resolved without any
+	// protection from errors, however it still properly locates the error.
 	if returnType, ok := returnType.(*NonNull); ok {
-		completed := completeValue(eCtx, returnType, fieldASTs, info, result)
-		return completed
+		return completeValueWithLocatedError(eCtx, returnType, fieldASTs, info, result)
 	}
 
-	// catch panic
+	// Otherwise, error protection is applied, logging the error and resolving
+	// a null value for this field if one is encountered.
 	defer func() interface{} {
 		if r := recover(); r != nil {
-			if err, ok := r.(gqlerrors.FormattedError); ok {
-				eCtx.Errors = append(eCtx.Errors, err)
+			if err, ok := r.(error); ok {
+				// If `completeValueWithLocatedError` returned abruptly (threw an error),
+				// log the error and return null.
+				eCtx.Errors = append(eCtx.Errors, gqlerrors.FormatError(err))
+				return nil
 			}
-			return completed
 		}
+
 		return completed
 	}()
 
-	completed = completeValue(eCtx, returnType, fieldASTs, info, result)
+	completed = completeValueWithLocatedError(eCtx, returnType, fieldASTs, info, result)
 
 	if thunk, ok := getThunk(completed); ok {
+		// If `completeValueWithLocatedError` returned a rejected promise, log
+		// the rejection error and resolve to null.
+		// Note: we don't rely on a `catch` method, but we do expect "thenable"
+		// to take a second callback for the error case.
 		return thunk.Catch(func(err error) (interface{}, error) {
 			eCtx.Errors = append(eCtx.Errors, gqlerrors.FormatError(err))
 			return nil, nil
@@ -648,8 +667,38 @@ func completeValueCatchingError(eCtx *ExecutionContext, returnType Type, fieldAS
 	return completed
 }
 
-func completeValue(eCtx *ExecutionContext, returnType Type, fieldASTs []*ast.Field, info ResolveInfo, result interface{}) interface{} {
+func completeValueWithLocatedError(eCtx *ExecutionContext, returnType Type, fieldASTs []*ast.Field, info ResolveInfo, result interface{}) (completed interface{}) {
+	defer func() interface{} {
+		if r := recover(); r != nil {
+			var err error
+			if r, ok := r.(string); ok {
+				err = NewLocatedError(
+					fmt.Sprintf("%v", r),
+					FieldASTsToNodeASTs(fieldASTs),
+				)
+			}
+			if r, ok := r.(error); ok {
+				err = gqlerrors.FormatError(r)
+			}
 
+			panic(gqlerrors.FormatError(err))
+		}
+
+		return completed
+	}()
+
+	completed = completeValue(eCtx, returnType, fieldASTs, info, result)
+
+	if thunk, ok := getThunk(completed); ok {
+		completed = thunk.Catch(func(err error) (interface{}, error) {
+			return nil, gqlerrors.NewLocatedError(err, FieldASTsToNodeASTs(fieldASTs))
+		})
+	}
+
+	return
+}
+
+func completeValue(eCtx *ExecutionContext, returnType Type, fieldASTs []*ast.Field, info ResolveInfo, result interface{}) interface{} {
 	// If result is a thunk, apply lift over completeValue.
 	if thunk, ok := getThunk(result); ok {
 		return thunk.Then(func(value interface{}) (interface{}, error) {

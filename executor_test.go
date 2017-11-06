@@ -718,9 +718,9 @@ func TestNullsOutErrorSubtrees(t *testing.T) {
 		"sync": func() interface{} {
 			return "sync"
 		},
-		"syncError": graphql.Thunk(func() (interface{}, error) {
+		"syncError": func() (interface{}, error) {
 			panic("Error getting syncError")
-		}),
+		},
 	}
 	schema, err := graphql.NewSchema(graphql.SchemaConfig{
 		Query: graphql.NewObject(graphql.ObjectConfig{
