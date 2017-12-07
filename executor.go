@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/Sirupsen/logrus"
 	"github.com/graphql-go/graphql/gqlerrors"
 	"github.com/graphql-go/graphql/language/ast"
 )
@@ -334,8 +335,9 @@ func executeFields(p ExecuteFieldsParams) *Result {
 	// of resolving that field, which is possibly a thunk. Return
 	// a thunk that will return this same map, but with any
 	// thunks replaced with the values they resolved to.
+	thunk := thunkForMap(finalResults)
 	return &Result{
-		Data: thunkForMap(finalResults),
+		Data: thunk,
 	}
 }
 
@@ -560,6 +562,7 @@ func resolveField(eCtx *ExecutionContext, parentType *Object, source interface{}
 		if r := recover(); r != nil {
 			var err error
 			if r, ok := r.(string); ok {
+
 				err = NewLocatedError(
 					fmt.Sprintf("%v", r),
 					FieldASTsToNodeASTs(fieldASTs),
@@ -633,6 +636,7 @@ func completeValueCatchingError(eCtx *ExecutionContext, returnType Type, fieldAS
 	// If the field type is non-nullable, then it is resolved without any
 	// protection from errors, however it still properly locates the error.
 	if returnType, ok := returnType.(*NonNull); ok {
+		logrus.WithField("field", info.FieldName).Infof("nonnull")
 		return completeValueWithLocatedError(eCtx, returnType, fieldASTs, info, result)
 	}
 
@@ -641,7 +645,7 @@ func completeValueCatchingError(eCtx *ExecutionContext, returnType Type, fieldAS
 	defer func() interface{} {
 		if r := recover(); r != nil {
 			if err, ok := r.(error); ok {
-				// If `completeValueWithLocatedError` returned abruptly (threw an error),
+				// If `completeValueWithLocatedError` returned abruptly (panicked),
 				// log the error and return null.
 				eCtx.Errors = append(eCtx.Errors, gqlerrors.FormatError(err))
 				return nil
@@ -656,8 +660,6 @@ func completeValueCatchingError(eCtx *ExecutionContext, returnType Type, fieldAS
 	if thunk, ok := getThunk(completed); ok {
 		// If `completeValueWithLocatedError` returned a rejected promise, log
 		// the rejection error and resolve to null.
-		// Note: we don't rely on a `catch` method, but we do expect "thenable"
-		// to take a second callback for the error case.
 		return thunk.Catch(func(err error) (interface{}, error) {
 			eCtx.Errors = append(eCtx.Errors, gqlerrors.FormatError(err))
 			return nil, nil
@@ -691,7 +693,12 @@ func completeValueWithLocatedError(eCtx *ExecutionContext, returnType Type, fiel
 
 	if thunk, ok := getThunk(completed); ok {
 		completed = thunk.Catch(func(err error) (interface{}, error) {
-			return nil, gqlerrors.NewLocatedError(err, FieldASTsToNodeASTs(fieldASTs))
+
+			locatedErr := gqlerrors.NewLocatedError(err, FieldASTsToNodeASTs(fieldASTs))
+			formattedErr := gqlerrors.FormatError(locatedErr)
+
+			logrus.WithField("field", info.FieldName).Errorf("catch: %#v", formattedErr)
+			return nil, formattedErr
 		})
 	}
 
@@ -699,6 +706,7 @@ func completeValueWithLocatedError(eCtx *ExecutionContext, returnType Type, fiel
 }
 
 func completeValue(eCtx *ExecutionContext, returnType Type, fieldASTs []*ast.Field, info ResolveInfo, result interface{}) interface{} {
+	logrus.WithField("field", info.FieldName).Infof("Result: %#v, asts: %#v", result)
 	// If result is a thunk, apply lift over completeValue.
 	if thunk, ok := getThunk(result); ok {
 		return thunk.Then(func(value interface{}) (interface{}, error) {
@@ -720,11 +728,12 @@ func completeValue(eCtx *ExecutionContext, returnType Type, fieldASTs []*ast.Fie
 	if returnType, ok := returnType.(*NonNull); ok {
 		completed := completeValue(eCtx, returnType.OfType, fieldASTs, info, result)
 		if completed == nil {
-			err := NewLocatedError(
-				fmt.Sprintf("Cannot return null for non-nullable field %v.%v.", info.ParentType, info.FieldName),
-				FieldASTsToNodeASTs(fieldASTs),
-			)
-			panic(gqlerrors.FormatError(err))
+
+			// err := NewLocatedError(
+			// 	fmt.Sprintf("Cannot return null for non-nullable field %v.%v.", info.ParentType, info.FieldName),
+			// 	FieldASTsToNodeASTs(fieldASTs),
+			// )
+			panic(fmt.Sprintf("Cannot return null for non-nullable field %v.%v.", info.ParentType, info.FieldName))
 		}
 		return completed
 	}

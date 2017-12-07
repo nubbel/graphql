@@ -4,6 +4,7 @@ import (
 	"errors"
 	"reflect"
 
+	"github.com/Sirupsen/logrus"
 	"github.com/graphql-go/graphql/gqlerrors"
 )
 
@@ -28,6 +29,7 @@ func (t Thunk) done(
 	return func() (value interface{}, err error) {
 		defer func() {
 			if r := recover(); r != nil {
+				logrus.Warnf("thunk recover: %#v", r)
 				if r, ok := r.(string); ok {
 					err = errors.New(r)
 				}
@@ -38,12 +40,23 @@ func (t Thunk) done(
 		}()
 
 		value, err = t.Await()
-		if err != nil && errorHandler != nil {
-			value, err = errorHandler(err)
-		} else if successHandler != nil {
-			value, err = successHandler(value)
-		} else {
+
+		if err != nil {
+
+			if errorHandler != nil {
+				value, err = errorHandler(err)
+			}
+		}
+
+		if err != nil {
 			return
+		}
+
+		if successHandler != nil {
+			value, err = successHandler(value)
+			if err != nil {
+				return
+			}
 		}
 
 		// If one of the handlers returned another thunk, resolve it
@@ -63,7 +76,7 @@ func WhenAll(thunksOrValues []interface{}) Thunk {
 				value, err := thunk.Await()
 
 				if err != nil {
-					return nil, err
+					return "hey", err
 				}
 				thunksOrValues[index] = value
 			}
@@ -100,6 +113,9 @@ func thunkForMap(m map[string]interface{}) Thunk {
 	}
 
 	return WhenAll(thunksOrValues).Then(func(values interface{}) (interface{}, error) {
+		if values == nil {
+			return nil, nil
+		}
 		for i, v := range values.([]interface{}) {
 			m[keys[i]] = v
 		}

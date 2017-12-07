@@ -9,6 +9,7 @@ import (
 	"github.com/graphql-go/graphql/gqlerrors"
 	"github.com/graphql-go/graphql/language/location"
 	"github.com/graphql-go/graphql/testutil"
+	"github.com/stretchr/testify/assert"
 )
 
 var syncError = "sync"
@@ -23,10 +24,10 @@ var throwingData = map[string]interface{}{
 	"nonNullSync": func() interface{} {
 		panic(nonNullSyncError)
 	},
-	"promise": func() interface{} {
+	"promise": func() (interface{}, error) {
 		panic(promiseError)
 	},
-	"nonNullPromise": func() interface{} {
+	"nonNullPromise": func() (interface{}, error) {
 		panic(nonNullPromiseError)
 	},
 }
@@ -38,11 +39,11 @@ var nullingData = map[string]interface{}{
 	"nonNullSync": func() interface{} {
 		return nil
 	},
-	"promise": func() interface{} {
-		return nil
+	"promise": func() (interface{}, error) {
+		return nil, nil
 	},
-	"nonNullPromise": func() interface{} {
-		return nil
+	"nonNullPromise": func() (interface{}, error) {
+		return nil, nil
 	},
 }
 
@@ -75,11 +76,11 @@ func init() {
 	throwingData["nonNullNest"] = func() interface{} {
 		return throwingData
 	}
-	throwingData["promiseNest"] = func() interface{} {
-		return throwingData
+	throwingData["promiseNest"] = func() (interface{}, error) {
+		return throwingData, nil
 	}
-	throwingData["nonNullPromiseNest"] = func() interface{} {
-		return throwingData
+	throwingData["nonNullPromiseNest"] = func() (interface{}, error) {
+		return throwingData, nil
 	}
 
 	nullingData["nest"] = func() interface{} {
@@ -88,11 +89,11 @@ func init() {
 	nullingData["nonNullNest"] = func() interface{} {
 		return nullingData
 	}
-	nullingData["promiseNest"] = func() interface{} {
-		return nullingData
+	nullingData["promiseNest"] = func() (interface{}, error) {
+		return nullingData, nil
 	}
-	nullingData["nonNullPromiseNest"] = func() interface{} {
-		return nullingData
+	nullingData["nonNullPromiseNest"] = func() (interface{}, error) {
+		return nullingData, nil
 	}
 
 	dataType.AddFieldConfig("nest", &graphql.Field{
@@ -219,7 +220,8 @@ func TestNonNull_NullsASynchronouslyReturnedObjectThatContainsANullableFieldThat
 		Root:   throwingData,
 	}
 	result := testutil.TestExecute(t, ep)
-	if len(result.Errors) != len(expected.Errors) {
+	if !reflect.DeepEqual(expected.Errors, result.Errors) {
+		assert.Equal(t, expected.Errors, result.Errors)
 		t.Fatalf("Unexpected errors, Diff: %v", testutil.Diff(expected.Errors, result.Errors))
 	}
 	if !reflect.DeepEqual(expected, result) {
@@ -339,7 +341,7 @@ func TestNonNull_NullsAnObjectReturnedInAPromiseThatContainsANonNullableFieldTha
 		Root:   throwingData,
 	}
 	result := testutil.TestExecute(t, ep)
-	if len(result.Errors) != len(expected.Errors) {
+	if !reflect.DeepEqual(expected.Errors, result.Errors) {
 		t.Fatalf("Unexpected errors, Diff: %v", testutil.Diff(expected.Errors, result.Errors))
 	}
 	if !reflect.DeepEqual(expected, result) {

@@ -302,7 +302,7 @@ func init() {
 				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
 					id, err := strconv.Atoi(p.Args["id"].(string))
 					if err != nil {
-					  return nil, err
+						return nil, err
 					}
 					return GetHuman(id), nil
 				},
@@ -365,7 +365,7 @@ func TestExecute(t *testing.T, ep graphql.ExecuteParams) *graphql.Result {
 }
 
 func Diff(want, got interface{}) []string {
-	return []string{fmt.Sprintf("\ngot: %v", got), fmt.Sprintf("\nwant: %v\n", want)}
+	return []string{fmt.Sprintf("\ngot: %#v", got), fmt.Sprintf("\nwant: %#v\n", want)}
 }
 
 func ASTToJSON(t *testing.T, a ast.Node) interface{} {
